@@ -758,6 +758,7 @@ java.lang.InterruptedException
 java.util.Map
 simpledb.Permissions
 java.lang.Object
+java.util.Collections
 simpledb.DeadlockException
 simpledb.PageId
 ||:simpledb.systemtest.DeleteTest
