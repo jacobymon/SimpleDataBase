@@ -9,6 +9,12 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.List;
 
 
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Set;
+import java.util.HashSet;
+import java.util.concurrent.TimeUnit; 
+
 
 /**
  * BufferPool manages the reading and writing of pages into memory from
@@ -32,6 +38,8 @@ public class BufferPool {
     private final Map<PageId, Page> map;
 
     private final LockManager lockmgr;
+
+    private final LinkedList<PageId> lruList;
 
     /** Default number of pages passed to the constructor. This is used by
     other classes. BufferPool should use the numPages argument to the
@@ -93,28 +101,54 @@ public class BufferPool {
         throws TransactionAbortedException, DbException {
 
 
+        // try {
+        // lockmgr.acquireLock(tid, pid, perm);
+        // } catch (DeadlockException e) { 
+        //     throw new TransactionAbortedException(); 
+        // }
+
+        // if (this.map.containsKey(pid)) {
+        //     return this.map.get(pid);  
+        // }
+
+        // //get the page
+        // DbFile dbFile = Database.getCatalog().getDatabaseFile(pid.getTableId());
+        // Page page = dbFile.readPage(pid);
+
+        // //check if there's room in the buffer, if not evict a page
+        // if (this.map.size() >= this.numPages) {
+        //     evictPage();
+        // }
+
+        // //put the page in if there's room
+        // this.map.put(pid, page);
+        // return page;
+
         try {
         lockmgr.acquireLock(tid, pid, perm);
-        } catch (DeadlockException e) { 
-            throw new TransactionAbortedException(); 
-        }
+    } catch (DeadlockException e) { 
+        throw new TransactionAbortedException(); 
+    }
 
-        if (this.map.containsKey(pid)) {
-            return this.map.get(pid);  
-        }
+    // 2. LOOK UP PAGE
+    if (this.map.containsKey(pid)) {
+        // If the page is in the buffer pool, return it.
+        // We know we hold the correct lock (from Step 1).
+        return this.map.get(pid);  
+    }
 
-        //get the page
-        DbFile dbFile = Database.getCatalog().getDatabaseFile(pid.getTableId());
-        Page page = dbFile.readPage(pid);
+    // 3. PAGE MISS (Fetch from disk, evict if necessary, and add)
+    DbFile dbFile = Database.getCatalog().getDatabaseFile(pid.getTableId());
+    Page page = dbFile.readPage(pid);
 
-        //check if there's room in the buffer, if not evict a page
-        if (this.map.size() >= this.numPages) {
-            evictPage();
-        }
+    // 4. EVICTION CHECK (Must happen before putting the page in)
+    if (this.map.size() >= this.numPages) {
+        evictPage(); // NOTE: You must ensure evictPage() respects NO STEAL/FORCE policy
+    }
 
-        //put the page in if there's room
-        this.map.put(pid, page);
-        return page;
+    // 5. CACHE INSERT
+    this.map.put(pid, page);
+    return page;
     }
 
 
@@ -160,9 +194,31 @@ public class BufferPool {
     public void transactionComplete(TransactionId tid, boolean commit)
         throws IOException {
         
+        // 1. DEAL WITH DIRTY PAGES (FORCE / NO UNDO)
         if (commit) {
-        flushPages(tid);
-        }
+            // FORCE policy: Write all dirty pages for this transaction to disk on commit
+            flushPages(tid); 
+        } else {
+            // NO UNDO / ABORT: Throw away all dirty pages associated with this transaction
+            
+            // Get all PageIds dirty by this transaction
+            Set<PageId> pagesToDiscard = new HashSet<>();
+            for (Map.Entry<PageId, Page> entry : map.entrySet()) {
+                Page page = entry.getValue();
+                if (page.isDirty() != null && page.isDirty().equals(tid)) {
+                    pagesToDiscard.add(entry.getKey());
+                }
+            }
+            
+            // Discard the pages from the buffer pool
+            for (PageId pid : pagesToDiscard) {
+                // Since this page was dirty, we remove it to revert changes.
+                // The next access to this page will read the old, clean version from disk.
+                discardPage(pid); 
+            }
+        } 
+        
+        // 2. STRICT 2PL: Release all locks after commit/abort
         lockmgr.releaseAllLocks(tid);
 
     }
@@ -276,8 +332,15 @@ public class BufferPool {
     /** Write all pages of the specified transaction to disk.
      */
     public synchronized void flushPages(TransactionId tid) throws IOException {
-        // some code goes here
-        // not necessary for labs 1--4
+        // Implementation for the FORCE policy: write all pages dirtied by tid to disk.
+        for (Map.Entry<PageId, Page> entry : map.entrySet()) {
+            Page page = entry.getValue();
+            // Check if the page is dirty AND dirtied by the committing transaction (tid)
+            if (page.isDirty() != null && page.isDirty().equals(tid)) {
+                // flushPage will write the page and mark it clean
+                flushPage(entry.getKey()); 
+            }
+        }
     }
 
     /**
@@ -285,32 +348,63 @@ public class BufferPool {
      * Flushes the page to disk to ensure dirty pages are updated on disk.
      */
     private synchronized void evictPage() throws DbException {
-        PageId pageToEvict = null;
+    //     PageId pageToEvict = null;
 
-        // find a clean page to evict
-        for (PageId pid : map.keySet()) {
+    //     // find a clean page to evict
+    //     for (PageId pid : map.keySet()) {
+    //         Page page = map.get(pid);
+    //         if (page.isDirty() == null) {
+    //             pageToEvict = pid;
+    //             break;
+    //         }
+
+    //     }
+    
+
+    // if (pageToEvict == null) {
+    //     for (PageId pid : map.keySet()) {
+    //         pageToEvict = pid;
+    //         break;
+    //     }
+    // }
+
+    // try {
+    //     flushPage(pageToEvict);
+    // } catch (IOException e) {
+    //     throw new DbException("Error flushing page during eviction: " + e.getMessage());
+    // }
+
+    // map.remove(pageToEvict);
+
+    PageId pageToEvict = null;
+        
+        // Iterate through pages based on the LRU list (from least recently used)
+        for (PageId pid : lruList) { 
             Page page = map.get(pid);
+
+            // NO STEAL: Only evict if the page is NOT dirty (isDirty() returns null)
             if (page.isDirty() == null) {
                 pageToEvict = pid;
                 break;
             }
-
         }
+
+        if (pageToEvict == null) {
+            // Buffer pool is full of dirty pages that cannot be evicted (NO STEAL)
+            // This satisfies the requirement to throw DbException if all pages are dirty.
+            throw new DbException("BufferPool is full: Cannot evict any dirty page (NO STEAL policy).");
+        }
+
+        try {
+            // Flush the clean page (safe since it's not dirty, but call flushPage just in case)
+            flushPage(pageToEvict); 
+        } catch (IOException e) {
+            throw new DbException("Error flushing page during eviction: " + e.getMessage());
+        }
+
+        // Remove the page from the buffer pool and LRU list
+        map.remove(pageToEvict);
+        lruList.remove(pageToEvict);
     
-
-    if (pageToEvict == null) {
-        for (PageId pid : map.keySet()) {
-            pageToEvict = pid;
-            break;
-        }
-    }
-
-    try {
-        flushPage(pageToEvict);
-    } catch (IOException e) {
-        throw new DbException("Error flushing page during eviction: " + e.getMessage());
-    }
-
-    map.remove(pageToEvict);
     }
 }

@@ -15,8 +15,11 @@ import java.util.HashSet;
  */
 public class LockManager {
     
-    private final Map<PageId, Set<TransactionId>> readLocks = new HashMap<>();
-    private final Map<PageId, TransactionId> writeLocks = new HashMap<>();
+    // private final Map<PageId, Set<TransactionId>> readLocks = new HashMap<>();
+    // private final Map<PageId, TransactionId> writeLocks = new HashMap<>();
+
+    private final Map<PageId, Map<TransactionId, Permissions>> pageLocks;
+    private final Map<TransactionId, Set<PageId>> transactionLocks;
 
     final int LOCK_WAIT = 10;       // milliseconds
     
@@ -44,26 +47,46 @@ public class LockManager {
     public boolean acquireLock(TransactionId tid, PageId pid, Permissions perm)
 	throws DeadlockException {
 	    
-	while(!lock(tid, pid, perm)) { // keep trying to get the lock
+	// while(!lock(tid, pid, perm)) { // keep trying to get the lock
 	    
-	    synchronized(this) {
-		// you don't have the lock yet
-		// possibly some code here for Exercise 5, deadlock detection
-	    }
+	//     synchronized(this) {
+	// 	// you don't have the lock yet
+	// 	// possibly some code here for Exercise 5, deadlock detection
+	//     }
 	    
-	    try {
-		// couldn't get lock, wait for some time, then try again
-		Thread.sleep(LOCK_WAIT); 
-	    } catch (InterruptedException e) { // do nothing
-	    }
+	//     try {
+	// 	// couldn't get lock, wait for some time, then try again
+	// 	Thread.sleep(LOCK_WAIT); 
+	//     } catch (InterruptedException e) { // do nothing
+	//     }
 	    
-	}
+	// }
 	    
-	synchronized(this) {
-	    // for Exercise 5, might need some cleanup on deadlock detection data structure
-	}
+	// synchronized(this) {
+	//     // for Exercise 5, might need some cleanup on deadlock detection data structure
+	// }
 	    
-	return true;
+	// return true;
+
+    synchronized(this) { // Synchronize on the LockManager instance
+        while(!lock(tid, pid, perm)) { 
+            // Lock is NOT acquired. Must wait.
+            
+            // NOTE: Insert Exercise 5 deadlock check logic here
+            
+            try {
+                // Wait until another thread calls notifyAll() (in releaseLock)
+                this.wait(); 
+                
+                // If we wake up, the loop checks the lock condition again.
+                
+            } catch (InterruptedException e) { 
+                // Do nothing or re-throw
+            }
+        }
+    }
+    return true;
+    
     }
     
     /**
@@ -71,23 +94,26 @@ public class LockManager {
      * This method is used by BufferPool.transactionComplete()
      */
     public synchronized void releaseAllLocks(TransactionId tid) {
-	Set<PageId> pages = transactionLocks.get(tid);
-    if (pages != null) {
-        for (PageId pid : pages) {
-            releaseLock(tid, pid);
+        Set<PageId> pages = transactionLocks.get(tid);
+        
+        if (pages != null) {
+            // !!! CRITICAL FIX: CREATE A COPY TO ITERATE OVER !!!
+            // This copy ensures the iterator doesn't crash when releaseLock modifies the original set.
+            Set<PageId> pagesToRelease = new HashSet<>(pages); 
+
+            for (PageId pid : pagesToRelease) {
+                releaseLock(tid, pid);
+            }
         }
-    }
 	    
     }
     
     /** Return true if the specified transaction has a lock on the specified page */
     public synchronized boolean holdsLock(TransactionId tid, PageId pid) {
-        // Map<TransactionId, Permissions> locksOnPage = pageLocks.get(pid);
-        // return locksOnPage != null && locksOnPage.containsKey(tid);
-        return (writeLocks.get(pid) != null && writeLocks.get(pid).equals(tid)) ||
-               (readLocks.get(pid) != null && readLocks.get(pid).contains(tid));
+        Map<TransactionId, Permissions> locksOnPage = pageLocks.get(pid);
+        return locksOnPage != null && locksOnPage.containsKey(tid);
     }
-    }
+    
     
     /**
      * Answers the question: is this transaction "locked out" of acquiring lock on this page with this perm?
@@ -109,35 +135,54 @@ public class LockManager {
      *   if another tid is holding any sort of lock on pid, then the tid cannot currenty acquire the lock (return true).
      */
     private synchronized boolean locked(TransactionId tid, PageId pid, Permissions perm) {
-    Map<TransactionId, Permissions> locksOnPage = pageLocks.get(pid);
-    
-    // No locks on this page, so no conflict
-    if (locksOnPage == null) {
-        return false;
-    }
+        Map<TransactionId, Permissions> locksOnPage = pageLocks.get(pid);
+        
+        // Rule: If no one has a lock on this page, there's no conflict.
+        if (locksOnPage == null || locksOnPage.isEmpty()) {
+            return false;
+        }
 
-    for (Map.Entry<TransactionId, Permissions> entry : locksOnPage.entrySet()) {
-        TransactionId otherTid = entry.getKey();
-        Permissions existingPerm = entry.getValue();
+        // Iterate through all transactions (otherTid) that currently hold a lock on pid.
+        for (Map.Entry<TransactionId, Permissions> entry : locksOnPage.entrySet()) {
+            TransactionId otherTid = entry.getKey();
+            Permissions existingPerm = entry.getValue();
 
-        if (otherTid.equals(tid)) {
-            // If this transaction already holds a compatible lock, allow it
-            if (perm == Permissions.READ_ONLY || existingPerm == Permissions.READ_WRITE) {
-                return false;
-            } else if (perm == Permissions.READ_WRITE && existingPerm == Permissions.READ_ONLY && locksOnPage.size() == 1) {
-                // Transaction can upgrade if it's the only one with a READ lock
-                return false;
-            }
-        } else {
-            // Check conflicts with other transactions
-            if (perm == Permissions.READ_WRITE || existingPerm == Permissions.READ_WRITE) {
-                return true;
+            // Case 1: Checking if the lock is held by the requesting transaction (tid).
+            if (otherTid.equals(tid)) {
+                // A. If tid holds an X-lock (READ_WRITE), it can get any lock (including another X-lock).
+                // B. If tid holds an S-lock (READ_ONLY), it can get another S-lock.
+                if (existingPerm == Permissions.READ_WRITE || perm == Permissions.READ_ONLY) {
+                    return false;
+                }
+                
+                // C. Lock Upgrade Check: If tid holds an S-lock and wants an X-lock,
+                //    it's allowed ONLY IF it's the sole holder of a lock on the page.
+                if (perm == Permissions.READ_WRITE && existingPerm == Permissions.READ_ONLY) {
+                    // If the requesting transaction is the ONLY one on the page, allow the upgrade.
+                    if (locksOnPage.size() == 1){
+                        return false; //not locked
+                    } else {
+                        return true; // not the only lock, so theres a conflict and it's locked
+                    }
+                }
+                // If any other compatible case is covered, it falls through to the end (return false).
+            } 
+            
+            // Case 2: Checking for conflicts with another transaction (otherTid != tid).
+            else {
+                // Fundamental Conflict Rule: Any lock request conflicts if either the existing
+                // lock or the requested lock is an X-lock (READ_WRITE).
+                // A Read lock (S) conflicts with a Write lock (X), and a Write lock (X) conflicts with everything.
+                if (perm == Permissions.READ_WRITE || existingPerm == Permissions.READ_WRITE) {
+                    return true; // Conflict found with a different transaction.
+                }
             }
         }
-    }
     
+    // If the loop completes without finding any conflicts, the lock can be acquired.
     return false;
-}
+    }
+
     
     /**
      * Releases whatever lock this transaction has on this page
@@ -148,36 +193,29 @@ public class LockManager {
      * However, if you decide to change the fact that a thread is sleeping in acquireLock(), you would have to wake it up here
      */
     public synchronized void releaseLock(TransactionId tid, PageId pid) {
-	// Map<TransactionId, Permissions> locksOnPage = pageLocks.get(pid);
-    // if (locksOnPage != null) {
-    //     locksOnPage.remove(tid);
-    //     if (locksOnPage.isEmpty()) {
-    //         pageLocks.remove(pid);
-    //     }
-    // }
-
-    // Set<PageId> pages = transactionLocks.get(tid);
-    // if (pages != null) {
-    //     pages.remove(pid);
-    //     if (pages.isEmpty()) {
-    //         transactionLocks.remove(tid);
-    //     }
-    // }
-
-    // Remove the write lock if held by this transaction
-        if (writeLocks.get(pid) != null && writeLocks.get(pid).equals(tid)) {
-            writeLocks.remove(pid);
-        }
-        // Remove the read lock if held by this transaction
-        if (readLocks.get(pid) != null) {
-            readLocks.get(pid).remove(tid);
-            // Clean up the set if empty
-            if (readLocks.get(pid).isEmpty()) {
-                readLocks.remove(pid);
+        //release the lock held by tid on pid
+        Map<TransactionId, Permissions> locksOnPage = pageLocks.get(pid);
+        if (locksOnPage != null) {
+            locksOnPage.remove(tid);
+            if (locksOnPage.isEmpty()) {
+                pageLocks.remove(pid);
             }
         }
-	    
+
+        // Remove the page from the transaction's lock set
+        Set<PageId> pages = transactionLocks.get(tid);
+        if (pages != null) {
+            pages.remove(pid);
+            if (pages.isEmpty()) {
+                transactionLocks.remove(tid);
+            }
+        }
+        notifyAll(); // Notify any waiting threads that a lock has been released
+       
     }
+    
+        
+    
     
     /**
      * Attempt to lock the given PageId with the given Permissions for this TransactionId
@@ -186,38 +224,18 @@ public class LockManager {
      * Returns true if the lock attempt was successful, false otherwise
      */
     private synchronized boolean lock(TransactionId tid, PageId pid, Permissions perm) {
-	    
-	// if(locked(tid, pid, perm)) 
-	//     return false; // this transaction cannot get the lock on this page; it is "locked out"
+        if(locked(tid, pid, perm)) // Path 1: Conflict Found
+        return false; // <-- RETURNS FALSE HERE
 
-	// // Else, this transaction is able to get the lock, update lock table
-	// // Acquire lock: update pageLocks and transactionLocks
-    // pageLocks.putIfAbsent(pid, new HashMap<>());
-    // pageLocks.get(pid).put(tid, perm);
+        // Path 2: No Conflict (Lock can be acquired or upgraded)
+        // Acquire lock: update pageLocks and transactionLocks
+        pageLocks.putIfAbsent(pid, new HashMap<>());
+        pageLocks.get(pid).put(tid, perm); // Lock is acquired/upgraded
 
-    // transactionLocks.putIfAbsent(tid, new HashSet<>());
-    // transactionLocks.get(tid).add(pid);
+        transactionLocks.putIfAbsent(tid, new HashSet<>());
+        transactionLocks.get(tid).add(pid); // Lock is tracked
 
-    // return true;
-
-    if (perm == Permissions.READ_ONLY) {
-            // Check if there's an existing write lock by another transaction
-            if (writeLocks.containsKey(pid) && !writeLocks.get(pid).equals(tid)) {
-                return false; // Another transaction has the write lock, deny access
-            }
-            // Grant read lock by adding this transaction to the read lock set
-            readLocks.computeIfAbsent(pid, k -> new HashSet<>()).add(tid);
-            return true; // Lock acquired
-        } else { // For READ_WRITE permission
-            // Check for conflicting locks (any read locks or a write lock by another transaction)
-            if ((readLocks.containsKey(pid) && !readLocks.get(pid).contains(tid)) ||
-                (writeLocks.containsKey(pid) && !writeLocks.get(pid).equals(tid))) {
-                return false; // Conflict exists, deny access
-            }
-            // Grant write lock, clearing any read locks held by this transaction
-            readLocks.remove(pid); // Remove all read locks for this page
-            writeLocks.put(pid, tid); // Grant write lock to this transaction
-            return true; // Lock acquired
-        }
+        return true;
     }
+        
 }

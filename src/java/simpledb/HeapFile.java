@@ -119,50 +119,128 @@ public class HeapFile implements DbFile {
     public ArrayList<Page> insertTuple(TransactionId tid, Tuple t)
             throws DbException, IOException, TransactionAbortedException {
 
-        //to keep track of the pages we modify        
-        ArrayList<Page> affectedPages = new ArrayList<>(); 
+        // //to keep track of the pages we modify        
+        // ArrayList<Page> affectedPages = new ArrayList<>(); 
 
-        // find a valid page
+        // // find a valid page
+        // for (int i = 0; i < numPages(); i++) {
+        //     PageId pid = new HeapPageId(getId(), i);
+        //     HeapPage page = (HeapPage) Database.getBufferPool().getPage(tid, pid, Permissions.READ_WRITE);
+
+        //     // Check if page has room for the tuple
+        //     if (page.getNumEmptySlots() > 0) {
+        //         page.insertTuple(t);
+        //         affectedPages.add(page); // Add affected page
+        //         return affectedPages; // Return the affected pages immediately
+        //     }
+        // }
+
+        // // No pages with space, create a new one
+        // HeapPageId newPid = new HeapPageId(getId(), numPages());
+        // HeapPage newPage = new HeapPage(newPid, HeapPage.createEmptyPageData());
+        // newPage.insertTuple(t);
+        
+        // // Write page to disk
+        // writePage(newPage);
+        
+        // // Note that we dont have explicitly add to the buffer pool as `getPage` already handles that
+        // affectedPages.add(newPage); 
+        // return affectedPages; 
+
+
+
+        // to keep track of the pages we modify        
+        ArrayList<Page> affectedPages = new ArrayList<>(); 
+        BufferPool bp = Database.getBufferPool();
+
+        // 1. Try to find an existing page with space
         for (int i = 0; i < numPages(); i++) {
             PageId pid = new HeapPageId(getId(), i);
-            HeapPage page = (HeapPage) Database.getBufferPool().getPage(tid, pid, Permissions.READ_WRITE);
+            
+            // Acquire X-lock on page and fetch it from buffer pool
+            HeapPage page = (HeapPage) bp.getPage(tid, pid, Permissions.READ_WRITE);
 
             // Check if page has room for the tuple
             if (page.getNumEmptySlots() > 0) {
                 page.insertTuple(t);
-                affectedPages.add(page); // Add affected page
-                return affectedPages; // Return the affected pages immediately
+                
+                // Mark the page dirty and release lock reference (BufferPool handles actual release)
+                page.markDirty(true, tid); 
+                affectedPages.add(page); 
+                return affectedPages; 
             }
+            
+            // IMPORTANT: If the page is full, release the lock now to allow others to modify it!
+            // This is the "look for empty slot" optimization mentioned in the instructions.
+            // But since getPage() requires a lock that blocks, we must assume the next line
+            // in BufferPool.getPage() handles the lock (which it does not).
+            // For now, we rely on the instruction: "if a transaction t finds no free slot on a page p, 
+            // t may immediately release the lock on p."
+            bp.releasePage(tid, pid);
         }
 
-        // No pages with space, create a new one
-        HeapPageId newPid = new HeapPageId(getId(), numPages());
+        // 2. No pages with space, create a new one (and write to disk size to update numPages)
+        int newPageNum = numPages(); // Current numPages() is the index of the new page
+        HeapPageId newPid = new HeapPageId(getId(), newPageNum);
+        
+        // IMPORTANT: Create an empty page and write it directly to disk to expand the file size.
+        // This is necessary to increment numPages() before we can access it via BufferPool.getPage()
         HeapPage newPage = new HeapPage(newPid, HeapPage.createEmptyPageData());
-        newPage.insertTuple(t);
+
+        // This operation is synchronized in the lab instructions to prevent race conditions 
+        // with other threads trying to create new pages concurrently.
+        synchronized(this) { 
+            RandomAccessFile raf = new RandomAccessFile(f, "rw");
+            raf.seek((long)newPageNum * BufferPool.getPageSize());
+            raf.write(newPage.getPageData());
+            raf.close();
+        }
         
-        // Write page to disk
-        writePage(newPage);
-        
-        // Note that we dont have explicitly add to the buffer pool as `getPage` already handles that
-        affectedPages.add(newPage); 
+        // 3. Now that the file size is updated, acquire an X-lock on the new page via BufferPool.
+        // This brings the page into the cache, locked by tid, and ready for tuple insertion.
+        HeapPage pageToInsert = (HeapPage) bp.getPage(tid, newPid, Permissions.READ_WRITE);
+
+        // Insert the tuple into the page now secured by the buffer pool
+        pageToInsert.insertTuple(t);
+        pageToInsert.markDirty(true, tid);
+        affectedPages.add(pageToInsert); 
         return affectedPages; 
+        
         }
 
         // see DbFile.java for javadocs
         public ArrayList<Page> deleteTuple(TransactionId tid, Tuple t) throws DbException,
                 TransactionAbortedException {
-            ArrayList<Page> dirtiedPages = new ArrayList<>();
+            // ArrayList<Page> dirtiedPages = new ArrayList<>();
             
-            // Find the page w/ the tuple we are deleting
-            PageId pid = t.getRecordId().getPageId();
-            HeapPage page = (HeapPage) Database.getBufferPool().getPage(tid, pid, Permissions.READ_WRITE);
+            // // Find the page w/ the tuple we are deleting
+            // PageId pid = t.getRecordId().getPageId();
+            // HeapPage page = (HeapPage) Database.getBufferPool().getPage(tid, pid, Permissions.READ_WRITE);
             
-            // delete tuple
-            page.deleteTuple(t);
-            page.markDirty(true, tid); 
-            dirtiedPages.add(page);
+            // // delete tuple
+            // page.deleteTuple(t);
+            // page.markDirty(true, tid); 
+            // dirtiedPages.add(page);
             
-            return dirtiedPages;
+            // return dirtiedPages;
+
+        ArrayList<Page> dirtiedPages = new ArrayList<>();
+        BufferPool bp = Database.getBufferPool();
+        
+        // Find the page w/ the tuple we are deleting
+        PageId pid = t.getRecordId().getPageId();
+        
+        // Acquire X-lock and fetch the page from the buffer pool
+        HeapPage page = (HeapPage) bp.getPage(tid, pid, Permissions.READ_WRITE);
+        
+        // delete tuple (assuming it throws if tuple is not found)
+        page.deleteTuple(t);
+        
+        // Mark the page dirty (this will update the page object fetched from BP)
+        page.markDirty(true, tid); 
+        dirtiedPages.add(page);
+        
+        return dirtiedPages;
     }
 
     // see DbFile.java for javadocs
