@@ -7,7 +7,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.HashSet;
 import java.util.concurrent.TimeUnit; 
-import java.util.Collections; // Added for thread safety in getTransactionsHoldingLock()
+import java.util.Collections; 
 
 /**
  * Manages locks on PageIds held by TransactionIds.
@@ -21,12 +21,8 @@ public class LockManager {
     private final Map<TransactionId, Set<PageId>> transactionLocks;
     
     // EXERCISE 5: WAITS-FOR GRAPH DATA STRUCTURE
-    // Key: The waiting transaction (tid)
-    // Value: The set of transactions (otherTid) that tid is waiting for.
     private final Map<TransactionId, Set<TransactionId>> waitsForGraph;
 
-    // Increased LOCK_WAIT time is no longer strictly necessary with cycle detection, 
-    // but keep it for wait() timeout.
     final int LOCK_WAIT = 50;       // milliseconds 
     
     /**
@@ -35,8 +31,7 @@ public class LockManager {
     public LockManager() {
         this.pageLocks = new HashMap<>(); 
         this.transactionLocks = new HashMap<>();
-        this.waitsForGraph = new HashMap<>(); // Initialize the graph
-	    
+        this.waitsForGraph = new HashMap<>(); 
     }
     
     /**
@@ -44,53 +39,44 @@ public class LockManager {
      * If cannot acquire the lock, blocks and waits.
      */
     public boolean acquireLock(TransactionId tid, PageId pid, Permissions perm)
-	throws DeadlockException {
-	    
-	synchronized(this) { 
+    throws DeadlockException {
         
-        while(!lock(tid, pid, perm)) { 
+        synchronized(this) { 
+            long startTime = System.currentTimeMillis();
             
-            // --- EXERCISE 5: DEADLOCK CYCLE DETECTION ---
+            while(!lock(tid, pid, perm)) { 
+                // Add waiting edges to graph
+                Set<TransactionId> holders = getTransactionsHoldingLock(tid, pid, perm); 
+                waitsForGraph.putIfAbsent(tid, new HashSet<>());
+                waitsForGraph.get(tid).addAll(holders);
 
-            // 1. Identify all transactions currently holding conflicting locks
-            // NOTE: The logic here needs to accurately capture the holders, including other readers 
-            // if we are attempting an S->X upgrade.
-            Set<TransactionId> holders = getTransactionsHoldingLock(tid, pid, perm); // Pass tid as well
+                // Check for deadlock
+                if (hasCycle(tid)) {
+                    waitsForGraph.remove(tid);
+                    throw new DeadlockException();
+                }
 
-            // 2. Add waiting edges to the Waits-For Graph
-            waitsForGraph.putIfAbsent(tid, new HashSet<>());
-            waitsForGraph.get(tid).addAll(holders);
+                try {
+                    wait(LOCK_WAIT);
+                } catch (InterruptedException e) {
+                    waitsForGraph.remove(tid);
+                    throw new DeadlockException();
+                }
 
-            // 3. Check for a cycle
-            if (hasCycle(tid)) {
-                // Remove the waiting edges before throwing the exception
-                waitsForGraph.remove(tid);
-                throw new DeadlockException();
+                // Check for timeout
+                if (System.currentTimeMillis() - startTime > 1000) { // 1 second timeout
+                    waitsForGraph.remove(tid);
+                    throw new DeadlockException();
+                }
             }
-
-            try {
-                // Wait until notified or until timeout
-                this.wait(LOCK_WAIT); 
-                
-                // If we wake up, remove the waiting edges (as tid is no longer actively waiting)
-                waitsForGraph.remove(tid);
-                
-            } catch (InterruptedException e) { 
-                waitsForGraph.remove(tid);
-                throw new DeadlockException(); 
-            }
+            
+            waitsForGraph.remove(tid);
+            return true;
         }
-        
-        // After successfully acquiring the lock, ensure tid is not marked as waiting
-        waitsForGraph.remove(tid);
-        return true;
-    }
     }
     
     /**
      * Helper method to find all transactions that currently block the requested lock.
-     * Only called when a conflict is found in lock() -> locked().
-     * This method must be robust enough to handle the lock upgrade case.
      */
     private Set<TransactionId> getTransactionsHoldingLock(TransactionId tid, PageId pid, Permissions perm) {
         Set<TransactionId> holders = new HashSet<>();
@@ -102,38 +88,15 @@ public class LockManager {
             TransactionId otherTid = entry.getKey();
             Permissions existingPerm = entry.getValue();
 
-            // Case 1: Standard Conflict - Lock requested is X, or existing is X
-            // This covers all X-lock conflicts.
-            if (perm == Permissions.READ_WRITE || existingPerm == Permissions.READ_WRITE) {
-                if (!otherTid.equals(tid)) {
-                    holders.add(otherTid);
-                }
-            } 
-            
-            // Case 2: Lock Upgrade Conflict - T1 is upgrading (S->X) and blocked by T2 (S)
-            // If the requesting transaction (tid) has an S-lock, and wants an X-lock, 
-            // and another transaction (otherTid) also holds an S-lock, tid must wait for otherTid.
-            else if (perm == Permissions.READ_WRITE && !otherTid.equals(tid)) {
-                 // Check if the current tid holds an S-lock on this page
-                 // Since we are iterating over locksOnPage, we need to check if tid has S-lock
-                 // This requires a separate check because otherTid is T2, not T1.
-
-                 // The simplified check: if otherTid holds ANY lock, and T1 is requesting X, T1 might be waiting.
-                 // We rely on the 'locked' method's return of TRUE to indicate a valid blocking state.
-                 // In the upgrade scenario (T1 has S, T2 has S, T1 requests X), T1 is blocked by T2's S-lock.
-                 
-                 // Since we know we are blocked (because lock() returned false), and we are iterating 
-                 // over holders, we check if otherTid is a non-compatible holder.
-
-                 // If T1 wants X-lock AND T1 has S-lock AND T2 has S-lock, T1 waits for T2.
-                 // The 'existingPerm' for otherTid is S, so the main conflict 'if' above is false.
-                 
-                 // CRITICAL FIX: Explicitly include the upgrade block rule in the holder check.
-                 // T1 requests X, T2 holds S: T1 must wait for T2.
-                 if (existingPerm == Permissions.READ_ONLY && perm == Permissions.READ_WRITE) {
-                      holders.add(otherTid);
-                 }
+            // Ignore the transaction that is requesting the lock (self-check)
+            if (otherTid.equals(tid)) {
+                continue;
             }
+
+            // CONFLICT RULE: Block if requested is X OR existing is X. 
+            if (perm == Permissions.READ_WRITE || existingPerm == Permissions.READ_WRITE) {
+                 holders.add(otherTid);
+            } 
         }
         return holders;
     }
@@ -142,19 +105,15 @@ public class LockManager {
      * Helper method to perform Depth First Search (DFS) for cycles in the Waits-For Graph.
      */
     private boolean hasCycle(TransactionId tid) {
-        // Recursive DFS call, tracking visited nodes in current path and overall visited nodes.
-        // We initialize 'visited' inside the helper, but the base call needs a clean start.
         return hasCycleHelper(tid, new HashSet<>(), new HashSet<>());
     }
 
     private boolean hasCycleHelper(TransactionId currentTid, Set<TransactionId> path, Set<TransactionId> visited) {
         if (path.contains(currentTid)) {
-            // Cycle detected: currentTid is already in the current recursion path.
             return true;
         }
 
         if (visited.contains(currentTid)) {
-            // Already checked this subtree, no cycle here.
             return false;
         }
 
@@ -170,7 +129,7 @@ public class LockManager {
             }
         }
 
-        path.remove(currentTid); // Backtrack
+        path.remove(currentTid);
         return false;
     }
 
@@ -183,14 +142,12 @@ public class LockManager {
         Set<PageId> pages = transactionLocks.get(tid);
         
         if (pages != null) {
-            // CRITICAL FIX: Iterate over a copy to avoid ConcurrentModificationException
             Set<PageId> pagesToRelease = new HashSet<>(pages); 
 
             for (PageId pid : pagesToRelease) {
                 releaseLock(tid, pid);
             }
         }
-        // Ensure that transaction is not waiting if it was aborted/completed
         waitsForGraph.remove(tid);
     }
     
@@ -203,47 +160,40 @@ public class LockManager {
     
     /**
      * Answers the question: is this transaction "locked out" of acquiring lock on this page with this perm?
+     *
+     * IMPORTANT: This method determines blocking behavior.
      */
     private synchronized boolean locked(TransactionId tid, PageId pid, Permissions perm) {
         Map<TransactionId, Permissions> locksOnPage = pageLocks.get(pid);
         
-        // Rule 1: If no one has a lock, there's no conflict.
         if (locksOnPage == null || locksOnPage.isEmpty()) {
             return false;
         }
 
-        // Iterate through all existing lock entries
-        for (Map.Entry<TransactionId, Permissions> entry : locksOnPage.entrySet()) {
-            TransactionId otherTid = entry.getKey();
-            Permissions existingPerm = entry.getValue();
+        // Check existing lock by this transaction
+        Permissions existingPerm = locksOnPage.get(tid);
+        if (existingPerm != null) {
+            // Already has the exact lock needed
+            if (existingPerm.equals(perm)) {
+                return false;
+            }
+            // Upgrade case (S->X)
+            if (perm == Permissions.READ_WRITE && existingPerm == Permissions.READ_ONLY) {
+                return locksOnPage.size() > 1;
+            }
+            // Downgrade case (X->S) or same permission
+            return false;
+        }
 
-            // Case 1: Lock held by the requesting transaction (tid)
-            if (otherTid.equals(tid)) {
-                
-                // Trivial: tid already holds X-lock, or is re-requesting S-lock. NO conflict.
-                if (existingPerm == Permissions.READ_WRITE || perm == Permissions.READ_ONLY) {
-                    return false;
-                }
-                
-                // C. Lock Upgrade Check (S -> X): Must be the SOLE holder
-                if (perm == Permissions.READ_WRITE && existingPerm == Permissions.READ_ONLY) {
-                    // Conflict if there is MORE than just this transaction's lock (size > 1).
-                    return locksOnPage.size() > 1; 
-                }
-            } 
-            
-            // Case 2: Lock held by a different transaction (otherTid != tid)
-            else {
-                // CONFLICT RULE: Block if either the request is X, or the existing lock is X.
-                // S vs S is the only compatible non-self interaction.
-                if (perm == Permissions.READ_WRITE || existingPerm == Permissions.READ_WRITE) {
-                    return true; // Conflict found, block immediately.
-                }
+        // Check conflicts with other transactions
+        for (Map.Entry<TransactionId, Permissions> entry : locksOnPage.entrySet()) {
+            if (entry.getValue() == Permissions.READ_WRITE || 
+                perm == Permissions.READ_WRITE) {
+                return true;
             }
         }
-    
-    // If the loop completes without finding any reason to block, the lock can be acquired.
-    return false;
+        
+        return false;
     }
 
     

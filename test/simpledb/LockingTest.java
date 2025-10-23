@@ -87,13 +87,16 @@ public class LockingTest extends TestUtil.CreateHeapFile {
     TestUtil.LockGrabber t = new TestUtil.LockGrabber(tid, pid, perm);
     t.start();
 
-    // if we don't have the lock after TIMEOUT, we assume blocking.
+    // Wait for TIMEOUT milliseconds
     Thread.sleep(TIMEOUT);
+    
+    // Check if lock was acquired as expected
     assertEquals(expected, t.acquired());
     assertNull(t.getError());
 
-    // TODO(ghuo): yes, stop() is evil, but this is unit test cleanup
-    t.stop();
+    // Instead of t.stop(), use interruption
+    t.interrupt();
+    t.join(TIMEOUT); // Wait for thread to finish
   }
 
   /**
